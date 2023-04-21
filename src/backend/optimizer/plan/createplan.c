@@ -3013,6 +3013,8 @@ create_indexscan_plan(PlannerInfo *root,
 	Assert(best_path->indexscandir == ForwardScanDirection ||
 		   best_path->indexscandir == BackwardScanDirection);
 
+    ereport(LOG, (errmsg("Creating IndexScan with %d indexclauses", list_length(best_path->indexclauses))));
+
 	/*
 	 * Extract the index qual expressions (stripped of RestrictInfos) from the
 	 * IndexClauses list, and prepare a copy with index Vars substituted for
@@ -3069,6 +3071,7 @@ create_indexscan_plan(PlannerInfo *root,
 			predicate_implied_by(list_make1(rinfo->clause), stripped_indexquals,
 								 false))
 			continue;			/* provably implied by indexquals */
+
 		qpqual = lappend(qpqual, rinfo);
 	}
 
@@ -4395,6 +4398,99 @@ create_nestloop_plan(PlannerInfo *root,
 	return join_plan;
 }
 
+
+void
+maybe_attach_non_null_index_cond(PlannerInfo* root,
+                                 Expr* expr,
+                                 Path* join_path) {
+            if (!IsA(expr, Var)) {
+                ereport(LOG, (errmsg("Expression is not a Var")));
+                print(expr);
+            } else {
+                Var *var = castNode(Var, expr);
+                if (join_path->pathtype == T_IndexScan || join_path->pathtype == T_IndexOnlyScan) {
+                    IndexPath *index_path = castNode(IndexPath, join_path);
+                    IndexOptInfo *index_info = index_path->indexinfo;
+
+                    int indexcol = -1;
+
+                    for (int i = 0; i < index_info->ncolumns; i++) {
+                        if (index_info->indexkeys[i] == var->varattno) {
+                            indexcol = i;
+                        }
+                    }
+                    if (indexcol == -1) {
+                        ereport(LOG, (errmsg("Var is unexpectedly not present in index")));
+                    } else {
+                        NullTest *null_test = makeNode(NullTest);
+                        null_test->nulltesttype = IS_NOT_NULL;
+                        null_test->arg = expr;
+                        null_test->location = -1;
+                        RestrictInfo* new_rinfo = make_simple_restrictinfo(root, null_test);
+
+                        ereport(LOG, (errmsg("Adding outer null test to index scan; info ncolumns=%d nkeycolumns=%d", index_info->ncolumns, index_info->nkeycolumns)));
+                        IndexClause *new_indexclause = makeNode(IndexClause);
+                        new_indexclause->rinfo = new_rinfo;
+                        new_indexclause->indexquals = lappend(NIL, new_rinfo);;
+                        new_indexclause->indexcol = indexcol;
+
+                        bool already_seen = false;
+
+                        // Assert precondition
+                        ListCell *lc2;
+                        int last_value = 0;
+                        foreach(lc2, index_path->indexclauses) {
+                            IndexClause *item = castNode(IndexClause, lfirst(lc2));
+                            Assert(item->indexcol >= last_value);
+                            last_value = item->indexcol;
+
+                            if (item->indexcol == indexcol && IsA(item->rinfo->clause, NullTest)) {
+                                NullTest *maybe_redundant_null_test = castNode(NullTest, item->rinfo->clause);
+                                if (IsA(maybe_redundant_null_test->arg, Var)) {
+                                    Var *maybe_redundant_var = castNode(Var, maybe_redundant_null_test->arg);
+                                    if (maybe_redundant_null_test->nulltesttype == IS_NOT_NULL && var->varattno == maybe_redundant_var->varattno) {
+                                        already_seen = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (already_seen) {
+                            ereport(LOG, (errmsg("explicit is-not-null is already present; no need to add it")));
+                            return;
+                        }
+
+                        int insertion_point = -1;
+                        foreach(lc2, index_path->indexclauses) {
+                            IndexClause *item = castNode(IndexClause, lfirst(lc2));
+                            if (item->indexcol > indexcol) {
+                                insertion_point = foreach_current_index(lc2);
+                                break;
+                            }
+                        }
+                        if (insertion_point == -1) {
+                            index_path->indexclauses = lappend(index_path->indexclauses, new_indexclause);
+                        } else {
+                            index_path->indexclauses = list_insert_nth(index_path->indexclauses, insertion_point, new_indexclause);
+                        }
+
+
+                        ereport(LOG, (errmsg("new IndexClause")));
+                        print(new_indexclause);
+
+                        // Assert postcondition
+                        foreach(lc2, index_path->indexclauses) {
+                            IndexClause *item = castNode(IndexClause, lfirst(lc2));
+                            Assert(item->indexcol >= last_value);
+                            last_value = item->indexcol;
+                        }
+                    }
+                }
+            }
+}
+
+
+
 static MergeJoin *
 create_mergejoin_plan(PlannerInfo *root,
 					  MergePath *best_path)
@@ -4421,6 +4517,102 @@ create_mergejoin_plan(PlannerInfo *root,
 	ListCell   *lip;
 	Path	   *outer_path = best_path->jpath.outerjoinpath;
 	Path	   *inner_path = best_path->jpath.innerjoinpath;
+
+    ereport(LOG, (errmsg("Creating MergeJoin plan!")));
+
+	if (best_path->jpath.jointype == JOIN_INNER) {
+        ereport(LOG, (errmsg("It's for an inner join, so nulls will not be included in the output anyway.")));
+
+        ListCell *lc;
+        foreach(lc, best_path->path_mergeclauses) {
+            RestrictInfo* restrict_info = (RestrictInfo*) lfirst(lc);
+
+            Expr *merge_clause_expr = (Expr*) restrict_info->clause;
+            if (!IsA(merge_clause_expr, OpExpr)) {
+                ereport(LOG, (errmsg("Expression in RestrictInfo is not OpExpr")));
+                continue;
+            }
+            OpExpr *merge_clause_opexpr = (OpExpr*) merge_clause_expr;
+
+            if (2 != list_length(merge_clause_opexpr->args)) {
+                ereport(LOG, (errmsg("OpExpr in RestrictInfo is not len(args)=2")));
+                continue;
+            }
+
+            Expr *outer_expr = linitial(merge_clause_opexpr->args);
+            Expr *inner_expr = lsecond(merge_clause_opexpr->args);
+
+            maybe_attach_non_null_index_cond(root, inner_expr, best_path->jpath.innerjoinpath);
+            maybe_attach_non_null_index_cond(root, outer_expr, best_path->jpath.outerjoinpath);
+
+            /*
+            if (!IsA(outer_expr, Var)) {
+                ereport(LOG, (errmsg("Expression is not a Var")));
+                print(outer_expr);
+            } else {
+                Var *var = castNode(Var, outer_expr);
+                Path *outer_join_path = best_path->jpath.outerjoinpath;
+                if (outer_join_path->pathtype == T_IndexScan || outer_join_path->pathtype == T_IndexOnlyScan) {
+                    IndexPath *index_path = castNode(IndexPath, outer_join_path);
+                    IndexOptInfo *index_info = index_path->indexinfo;
+
+                    int indexcol = -1;
+
+                    for (int i = 0; i < index_info->ncolumns; i++) {
+                        if (index_info->indexkeys[i] == var->varattno) {
+                            indexcol = i;
+                        }
+                    }
+                    if (indexcol == -1) {
+                        ereport(LOG, (errmsg("Var is unexpectedly not present in index")));
+                    } else {
+                        NullTest *null_test = makeNode(NullTest);
+                        null_test->nulltesttype = IS_NOT_NULL;
+                        null_test->arg = outer_expr;
+                        null_test->location = -1;
+                        RestrictInfo* new_rinfo = make_simple_restrictinfo(root, null_test);
+
+                        ereport(LOG, (errmsg("Adding outer null test to index scan; info ncolumns=%d nkeycolumns=%d", index_info->ncolumns, index_info->nkeycolumns)));
+                        IndexClause *new_indexclause = makeNode(IndexClause);
+                        new_indexclause->rinfo = new_rinfo;
+                        new_indexclause->indexquals = lappend(NIL, new_rinfo);;
+                        new_indexclause->indexcol = indexcol;
+
+                        // Assert precondition
+                        ListCell *lc2;
+                        int last_value = 0;
+                        foreach(lc2, index_path->indexclauses) {
+                            IndexClause *item = castNode(IndexClause, lfirst(lc2));
+                            Assert(item->indexcol >= last_value);
+                            last_value = item->indexcol;
+                        }
+
+                        int insertion_point = -1;
+                        foreach(lc2, index_path->indexclauses) {
+                            IndexClause *item = castNode(IndexClause, lfirst(lc2));
+                            if (item->indexcol > indexcol) {
+                                insertion_point = foreach_current_index(lc2);
+                                break;
+                            }
+                        }
+                        if (insertion_point == -1) {
+                            index_path->indexclauses = lappend(index_path->indexclauses, new_indexclause);
+                        } else {
+                            index_path->indexclauses = list_insert_nth(index_path->indexclauses, insertion_point, new_indexclause);
+                        }
+
+                        // Assert postcondition
+                        foreach(lc2, index_path->indexclauses) {
+                            IndexClause *item = castNode(IndexClause, lfirst(lc2));
+                            Assert(item->indexcol >= last_value);
+                            last_value = item->indexcol;
+                        }
+                    }
+                }
+            }
+            */
+        }
+    }
 
 	/*
 	 * MergeJoin can project, so we don't have to demand exact tlists from the
