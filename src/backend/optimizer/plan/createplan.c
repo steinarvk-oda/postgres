@@ -3013,8 +3013,6 @@ create_indexscan_plan(PlannerInfo *root,
 	Assert(best_path->indexscandir == ForwardScanDirection ||
 		   best_path->indexscandir == BackwardScanDirection);
 
-    ereport(LOG, (errmsg("Creating IndexScan with %d indexclauses", list_length(best_path->indexclauses))));
-
 	/*
 	 * Extract the index qual expressions (stripped of RestrictInfos) from the
 	 * IndexClauses list, and prepare a copy with index Vars substituted for
@@ -3071,7 +3069,6 @@ create_indexscan_plan(PlannerInfo *root,
 			predicate_implied_by(list_make1(rinfo->clause), stripped_indexquals,
 								 false))
 			continue;			/* provably implied by indexquals */
-
 		qpqual = lappend(qpqual, rinfo);
 	}
 
