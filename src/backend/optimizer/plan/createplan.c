@@ -4448,6 +4448,23 @@ create_mergejoin_plan(PlannerInfo *root,
                 continue;
             }
 
+            /* TODO: We have not actually checked what sort of operator this is.
+             *       For a "normal" operator which has the property that
+             *         NULL OP x
+             *       and
+             *         x OP NULL
+             *       are both non-true for all x, the implication that any rows
+             *       where the join variables are null will be irrelevant should hold.
+             *
+             *       However, there's all sorts of operators, including custom ones.
+             *       I don't think it's necessarily true that _every_ operator has
+             *       this property.
+             *
+             *       We MUST ensure that we only trigger this when we can actually
+             *       guarantee this property for the operator. (If we can recognize
+             *       the common equality operators, that's probably good enough.)
+             */
+
             Expr *outer_expr = linitial(merge_clause_opexpr->args);
             Expr *inner_expr = lsecond(merge_clause_opexpr->args);
 
