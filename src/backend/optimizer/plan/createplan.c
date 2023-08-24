@@ -4423,6 +4423,54 @@ create_mergejoin_plan(PlannerInfo *root,
 	Path	   *inner_path = best_path->jpath.innerjoinpath;
 
 	/*
+     * For an inner join with a merge clause "x = y", "x IS NOT NULL" and
+     * "y IS NOT NULL" are logically implied. When one of the join paths
+     * is an index scan, turning this into an explicit index condition can have
+     * performance benefits.
+	 */
+	if (best_path->jpath.jointype == JOIN_INNER) {
+        ListCell *lc;
+        foreach(lc, best_path->path_mergeclauses) {
+            RestrictInfo* restrict_info = (RestrictInfo*) lfirst(lc);
+
+            Expr *merge_clause_expr = (Expr*) restrict_info->clause;
+            if (!IsA(merge_clause_expr, OpExpr)) {
+                ereport(LOG, (errmsg("Expression in RestrictInfo is not OpExpr")));
+                continue;
+            }
+            OpExpr *merge_clause_opexpr = (OpExpr*) merge_clause_expr;
+
+            if (2 != list_length(merge_clause_opexpr->args)) {
+                ereport(LOG, (errmsg("OpExpr in RestrictInfo is not len(args)=2")));
+                continue;
+            }
+
+            /* TODO: We have not actually checked what sort of operator this is.
+             *       For a "normal" operator which has the property that
+             *         NULL OP x
+             *       and
+             *         x OP NULL
+             *       are both non-true for all x, the implication that any rows
+             *       where the join variables are null will be irrelevant should hold.
+             *
+             *       However, there's all sorts of operators, including custom ones.
+             *       I don't think it's necessarily true that _every_ operator has
+             *       this property.
+             *
+             *       We MUST ensure that we only trigger this when we can actually
+             *       guarantee this property for the operator. (If we can recognize
+             *       the common equality operators, that's probably good enough.)
+             */
+
+            Expr *outer_expr = linitial(merge_clause_opexpr->args);
+            Expr *inner_expr = lsecond(merge_clause_opexpr->args);
+
+            maybe_attach_non_null_index_cond(root, inner_expr, best_path->jpath.innerjoinpath);
+            maybe_attach_non_null_index_cond(root, outer_expr, best_path->jpath.outerjoinpath);
+        }
+    }
+
+	/*
 	 * MergeJoin can project, so we don't have to demand exact tlists from the
 	 * inputs.  However, if we're intending to sort an input's result, it's
 	 * best to request a small tlist so we aren't sorting more data than
@@ -7241,3 +7289,101 @@ is_projection_capable_plan(Plan *plan)
 	}
 	return true;
 }
+
+/*
+ * maybe_attach_non_null_index_cond
+ *		If the specified join_path is an index path, and the expr is
+ *		a Var, attach an "IS NOT NULL" test for the var as an index
+ *		condition, unless it's already present.
+ */
+void
+maybe_attach_non_null_index_cond(PlannerInfo * root,
+				 Expr * expr,
+				 Path * join_path)
+{
+	if (!IsA(expr, Var)) {
+		ereport(LOG, (errmsg("Expression is not a Var")));
+		print(expr);
+	} else {
+		Var	       *var = castNode(Var, expr);
+		if (join_path->pathtype == T_IndexScan || join_path->pathtype == T_IndexOnlyScan) {
+			IndexPath      *index_path = castNode(IndexPath, join_path);
+			IndexOptInfo   *index_info = index_path->indexinfo;
+
+			int		indexcol = -1;
+
+			for (int i = 0; i < index_info->ncolumns; i++) {
+				if (index_info->indexkeys[i] == var->varattno && index_info->rel->relid == var->varno) {
+					indexcol = i;
+				}
+			}
+			if (indexcol == -1) {
+				ereport(LOG, (errmsg("Var is unexpectedly not present in index")));
+			} else {
+				NullTest       *null_test = makeNode(NullTest);
+				null_test->nulltesttype = IS_NOT_NULL;
+				null_test->arg = expr;
+				null_test->location = -1;
+				RestrictInfo   *new_rinfo = make_simple_restrictinfo(root, null_test);
+
+				ereport(LOG, (errmsg("Adding outer null test to index scan; info ncolumns=%d nkeycolumns=%d", index_info->ncolumns, index_info->nkeycolumns)));
+				IndexClause    *new_indexclause = makeNode(IndexClause);
+				new_indexclause->rinfo = new_rinfo;
+				new_indexclause->indexquals = lappend(NIL, new_rinfo);;
+				new_indexclause->indexcol = indexcol;
+
+				bool		already_seen = false;
+
+				//Assert precondition
+					ListCell * lc2;
+				int		last_value = 0;
+				foreach(lc2, index_path->indexclauses) {
+					IndexClause    *item = castNode(IndexClause, lfirst(lc2));
+					Assert(item->indexcol >= last_value);
+					last_value = item->indexcol;
+
+					if (item->indexcol == indexcol && IsA(item->rinfo->clause, NullTest)) {
+						NullTest       *maybe_redundant_null_test = castNode(NullTest, item->rinfo->clause);
+						if (IsA(maybe_redundant_null_test->arg, Var)) {
+							Var	       *maybe_redundant_var = castNode(Var, maybe_redundant_null_test->arg);
+							if (maybe_redundant_null_test->nulltesttype == IS_NOT_NULL && var->varattno == maybe_redundant_var->varattno) {
+								already_seen = true;
+							}
+						}
+					}
+				}
+
+				if (already_seen) {
+					ereport(LOG, (errmsg("explicit is-not-null is already present; no need to add it")));
+					return;
+				}
+
+				int		insertion_point = -1;
+				foreach(lc2, index_path->indexclauses) {
+					IndexClause    *item = castNode(IndexClause, lfirst(lc2));
+					if (item->indexcol > indexcol) {
+						insertion_point = foreach_current_index(lc2);
+						break;
+					}
+				}
+				if (insertion_point == -1) {
+					index_path->indexclauses = lappend(index_path->indexclauses, new_indexclause);
+				} else {
+					index_path->indexclauses = list_insert_nth(index_path->indexclauses, insertion_point, new_indexclause);
+				}
+
+
+				ereport(LOG, (errmsg("new IndexClause")));
+				print(new_indexclause);
+
+				//Assert postcondition
+				foreach(lc2, index_path->indexclauses) {
+					IndexClause    *item = castNode(IndexClause, lfirst(lc2));
+					Assert(item->indexcol >= last_value);
+					last_value = item->indexcol;
+				}
+			}
+		}
+	}
+}
+
